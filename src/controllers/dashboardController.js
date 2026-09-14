@@ -8,7 +8,10 @@ async function getDashboard(req, res) {
   try {
     const authorizationToken = getAuthorizationToken(req);
 
-    const dashboard = await getDashboardData(authorizationToken);
+    const dashboard = await getDashboardData(
+      authorizationToken,
+      req.auth.organizationId,
+    );
 
     return res.json(dashboard);
   } catch (error) {

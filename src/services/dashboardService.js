@@ -4,6 +4,8 @@ const {
   serviceServiceUrl,
 } = require("../config/services");
 
+const { redisClient } = require("../config/redis");
+
 /*
  * =========================================================
  * HTTP HELPERS
@@ -15,11 +17,7 @@ async function getJson(url, authorizationToken) {
     method: "GET",
     headers: {
       Accept: "application/json",
-      ...(authorizationToken
-        ? {
-            Authorization: authorizationToken,
-          }
-        : {}),
+      Authorization: authorizationToken,
     },
   });
 
@@ -60,60 +58,61 @@ function normalizeStatus(value) {
 
 /*
  * =========================================================
- * DISPLAY HELPERS
+ * SERVICE HELPERS
  * =========================================================
  */
 
-function getServiceReferences(record) {
+function getServiceNames(record) {
   if (!record) {
     return [];
   }
+
+  /*
+   * Preferred format:
+   *
+   * services: [
+   *   {
+   *     id: 1,
+   *     name: "CRM Implementation"
+   *   }
+   * ]
+   */
 
   if (Array.isArray(record.services)) {
     return record.services
       .map((service) => {
         if (typeof service === "string") {
-          return {
-            id: null,
-            name: service,
-          };
+          return service;
         }
 
-        return {
-          id: service?.id ?? service?.serviceId ?? null,
-          name: service?.name || service?.serviceName || null,
-        };
+        return service?.name || service?.serviceName;
       })
-      .filter((service) => service.id !== null || service.name);
+      .filter(Boolean);
   }
+
+  /*
+   * Fallback:
+   *
+   * serviceIds: [1, 2, 3]
+   *
+   * These will be resolved against the service
+   * catalog later.
+   */
 
   if (Array.isArray(record.serviceIds)) {
     return record.serviceIds
-      .map((serviceId) => ({
-        id: serviceId,
-        name: null,
-      }))
-      .filter((service) => service.id !== null);
+      .map((serviceId) => String(serviceId))
+      .filter(Boolean);
   }
 
   return [];
 }
 
-function getServiceNames(record, serviceById = new Map()) {
-  const references = getServiceReferences(record);
-
-  return references
-    .map((service) => {
-      if (service.name) {
-        return service.name;
-      }
-
-      const resolved = serviceById.get(String(service.id));
-
-      return resolved?.name || `Service #${service.id}`;
-    })
-    .filter(Boolean);
-}
+/*
+ * =========================================================
+ * DATE HELPERS
+ * =========================================================
+ */
 
 function getDateValue(record) {
   return (
@@ -131,17 +130,68 @@ function getDateValue(record) {
  * =========================================================
  */
 
-async function getDashboardData(authorizationToken) {
-  const startedAt = Date.now();
+async function getDashboardData(authorizationToken, organizationId) {
+  if (!organizationId) {
+    const error = new Error("Organization context is required.");
+
+    error.statusCode = 400;
+
+    throw error;
+  }
 
   /*
    * =======================================================
-   * FETCH DOMAIN DATA IN PARALLEL
+   * REDIS CACHE
    * =======================================================
    *
-   * Dashboard Service acts only as an aggregation layer.
+   * Cache is tenant scoped.
    *
-   * It does not access another service's database.
+   * Example:
+   *
+   * dashboard:org:1
+   * dashboard:org:2
+   *
+   * This prevents one organization's dashboard
+   * from being returned to another organization.
+   */
+
+  const cacheKey = `dashboard:org:${organizationId}`;
+
+  try {
+    const cached = await redisClient.get(cacheKey);
+
+    if (cached) {
+      console.log(`[Dashboard Cache] HIT ${cacheKey}`);
+
+      return JSON.parse(cached);
+    }
+
+    console.log(`[Dashboard Cache] MISS ${cacheKey}`);
+  } catch (error) {
+    /*
+     * Redis should never make the dashboard
+     * completely unavailable.
+     *
+     * If Redis fails, fall back to the domain
+     * services.
+     */
+
+    console.error("[Dashboard Cache] Read failed:", error);
+  }
+
+  /*
+   * =======================================================
+   * DOMAIN SERVICE REQUESTS
+   * =======================================================
+   *
+   * Dashboard Service does not access domain
+   * databases directly.
+   *
+   * It obtains data through:
+   *
+   * Lead Service
+   * Customer Service
+   * Service Service
    */
 
   const [leadData, customerData, serviceData] = await Promise.all([
@@ -152,6 +202,12 @@ async function getDashboardData(authorizationToken) {
     getJson(`${serviceServiceUrl}/services`, authorizationToken),
   ]);
 
+  /*
+   * =======================================================
+   * NORMALIZE API RESPONSES
+   * =======================================================
+   */
+
   const leads = Array.isArray(leadData) ? leadData : leadData?.leads || [];
 
   const customers = Array.isArray(customerData)
@@ -161,20 +217,6 @@ async function getDashboardData(authorizationToken) {
   const services = Array.isArray(serviceData)
     ? serviceData
     : serviceData?.services || [];
-
-  /*
-   * =======================================================
-   * SERVICE LOOKUP
-   * =======================================================
-   */
-
-  const serviceById = new Map();
-
-  services.forEach((service) => {
-    if (service?.id !== undefined && service?.id !== null) {
-      serviceById.set(String(service.id), service);
-    }
-  });
 
   /*
    * =======================================================
@@ -278,7 +320,7 @@ async function getDashboardData(authorizationToken) {
 
   function addServiceDemand(records) {
     records.forEach((record) => {
-      const recordServices = getServiceNames(record, serviceById);
+      const recordServices = getServiceNames(record);
 
       recordServices.forEach((serviceName) => {
         demandMap[serviceName] = (demandMap[serviceName] || 0) + 1;
@@ -288,6 +330,30 @@ async function getDashboardData(authorizationToken) {
 
   addServiceDemand(leads);
   addServiceDemand(customers);
+
+  /*
+   * Resolve service IDs into service names.
+   *
+   * Example:
+   *
+   * "1": 5
+   *
+   * becomes:
+   *
+   * "CRM Implementation": 5
+   */
+
+  services.forEach((service) => {
+    const serviceId = String(service.id);
+
+    if (demandMap[serviceId] !== undefined) {
+      const count = demandMap[serviceId];
+
+      delete demandMap[serviceId];
+
+      demandMap[service.name] = (demandMap[service.name] || 0) + count;
+    }
+  });
 
   const serviceDemand = Object.entries(demandMap)
     .map(([name, count]) => ({
@@ -324,55 +390,73 @@ async function getDashboardData(authorizationToken) {
   const qualifiedWithoutServices = leads.filter(
     (lead) =>
       normalizeStatus(lead.status) === "qualified" &&
-      getServiceReferences(lead).length === 0,
+      getServiceNames(lead).length === 0,
   );
 
   if (qualifiedWithoutServices.length > 0) {
     attentionItems.push({
       type: "warning",
+
       title: "Qualified leads need services",
+
       description:
         `${qualifiedWithoutServices.length} qualified lead` +
-        `${qualifiedWithoutServices.length === 1 ? "" : "s"} ` +
-        "have no services assigned.",
+        `${
+          qualifiedWithoutServices.length === 1 ? "" : "s"
+        } have no services assigned.`,
+
       count: qualifiedWithoutServices.length,
+
       link: "/leads",
+
       action: "Review leads",
     });
   }
 
   const leadsWithoutServices = leads.filter(
-    (lead) => getServiceReferences(lead).length === 0,
+    (lead) => getServiceNames(lead).length === 0,
   );
 
   if (leadsWithoutServices.length > 0) {
     attentionItems.push({
       type: "info",
+
       title: "Leads without services",
+
       description:
         `${leadsWithoutServices.length} lead` +
-        `${leadsWithoutServices.length === 1 ? "" : "s"} ` +
-        "currently have no service mapping.",
+        `${
+          leadsWithoutServices.length === 1 ? "" : "s"
+        } currently have no service mapping.`,
+
       count: leadsWithoutServices.length,
+
       link: "/leads",
+
       action: "Assign services",
     });
   }
 
   const customersWithoutServices = customers.filter(
-    (customer) => getServiceReferences(customer).length === 0,
+    (customer) => getServiceNames(customer).length === 0,
   );
 
   if (customersWithoutServices.length > 0) {
     attentionItems.push({
       type: "neutral",
+
       title: "Customers without services",
+
       description:
         `${customersWithoutServices.length} customer` +
-        `${customersWithoutServices.length === 1 ? "" : "s"} ` +
-        "have no services assigned.",
+        `${
+          customersWithoutServices.length === 1 ? "" : "s"
+        } have no services assigned.`,
+
       count: customersWithoutServices.length,
+
       link: "/customers",
+
       action: "Review customers",
     });
   }
@@ -383,13 +467,15 @@ async function getDashboardData(authorizationToken) {
    * =======================================================
    */
 
-  const activeServices = services.filter(
-    (service) => normalizeStatus(service.status) === "active",
-  ).length;
+  const activeServices = services.filter((service) => {
+    const status = normalizeStatus(service.status);
+
+    return !status || status === "active" || status === "enabled";
+  }).length;
 
   /*
    * =======================================================
-   * RESPONSE
+   * FINAL DASHBOARD RESPONSE
    * =======================================================
    */
 
@@ -414,7 +500,9 @@ async function getDashboardData(authorizationToken) {
 
     serviceCatalog: {
       totalServices: services.length,
+
       activeServices,
+
       servicesInDemand: serviceDemand.length,
     },
 
@@ -425,16 +513,24 @@ async function getDashboardData(authorizationToken) {
 
   /*
    * =======================================================
-   * PERFORMANCE LOGGING
+   * REDIS CACHE WRITE
    * =======================================================
+   *
+   * Cache for 30 seconds.
+   *
+   * If Redis write fails, the dashboard
+   * response is still returned normally.
    */
 
-  console.log(
-    `[Dashboard] Aggregated ${leads.length} leads, ` +
-      `${customers.length} customers and ` +
-      `${services.length} services in ` +
-      `${Date.now() - startedAt}ms`,
-  );
+  try {
+    await redisClient.set(cacheKey, JSON.stringify(dashboard), {
+      EX: 30,
+    });
+
+    console.log(`[Dashboard Cache] SET ${cacheKey} TTL=30s`);
+  } catch (error) {
+    console.error("[Dashboard Cache] Write failed:", error);
+  }
 
   return dashboard;
 }
