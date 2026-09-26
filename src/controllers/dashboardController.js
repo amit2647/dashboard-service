@@ -8,9 +8,11 @@ async function getDashboard(req, res) {
   try {
     const authorizationToken = getAuthorizationToken(req);
 
+    // Permissions include live just-in-time grants; they scope the cache.
     const dashboard = await getDashboardData(
       authorizationToken,
       req.auth.organizationId,
+      req.auth.permissions,
     );
 
     return res.json(dashboard);

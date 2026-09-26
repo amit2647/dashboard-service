@@ -6,7 +6,9 @@
     "scripts": {
         "start": "node src/server.js",
         "dev": "node --watch src/server.js",
-        "test": "node --test"
+        "test": "node --test",
+        "lint": "eslint .",
+        "coverage": "node --test --experimental-test-coverage"
     },
     "dependencies": {
         "cors": "^2.8.5",
@@ -14,5 +16,10 @@
         "jsonwebtoken": "^9.0.2",
         "pg": "^8.16.3",
         "redis": "^5.0.0"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.0",
+        "eslint": "^9.39.0",
+        "globals": "^17.12.0"
     }
 }

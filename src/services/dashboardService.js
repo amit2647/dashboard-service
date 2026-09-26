@@ -130,7 +130,38 @@ function getDateValue(record) {
  * =========================================================
  */
 
-async function getDashboardData(authorizationToken, organizationId) {
+/*
+ * The dashboard is built from the caller's own view of leads, customers and
+ * services — each fetched with their token. Which of those they can read
+ * decides what the figures contain, so it is part of the cache key: otherwise
+ * someone granted only the Dashboard would be served figures (and recent lead
+ * names) computed for an admin who loaded it moments earlier.
+ */
+const SOURCE_PERMISSIONS = ["leads.read", "customers.read", "services.read"];
+
+function readScope(permissions) {
+  const held = new Set(Array.isArray(permissions) ? permissions : []);
+
+  return SOURCE_PERMISSIONS.filter((permission) => held.has(permission)).join(",") || "none";
+}
+
+/*
+ * A source the caller may not read counts as empty rather than failing the
+ * whole dashboard. Any other failure still propagates.
+ */
+async function getJsonOrEmpty(url, authorizationToken) {
+  try {
+    return await getJson(url, authorizationToken);
+  } catch (error) {
+    if (error.statusCode === 403) {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+async function getDashboardData(authorizationToken, organizationId, permissions) {
   if (!organizationId) {
     const error = new Error("Organization context is required.");
 
@@ -155,7 +186,7 @@ async function getDashboardData(authorizationToken, organizationId) {
    * from being returned to another organization.
    */
 
-  const cacheKey = `dashboard:org:${organizationId}`;
+  const cacheKey = `dashboard:org:${organizationId}:${readScope(permissions)}`;
 
   try {
     const cached = await redisClient.get(cacheKey);
@@ -195,11 +226,11 @@ async function getDashboardData(authorizationToken, organizationId) {
    */
 
   const [leadData, customerData, serviceData] = await Promise.all([
-    getJson(`${leadServiceUrl}/leads`, authorizationToken),
+    getJsonOrEmpty(`${leadServiceUrl}/leads`, authorizationToken),
 
-    getJson(`${customerServiceUrl}/customers`, authorizationToken),
+    getJsonOrEmpty(`${customerServiceUrl}/customers`, authorizationToken),
 
-    getJson(`${serviceServiceUrl}/services`, authorizationToken),
+    getJsonOrEmpty(`${serviceServiceUrl}/services`, authorizationToken),
   ]);
 
   /*
@@ -537,4 +568,5 @@ async function getDashboardData(authorizationToken, organizationId) {
 
 module.exports = {
   getDashboardData,
+  readScope,
 };
