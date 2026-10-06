@@ -139,6 +139,50 @@ function getDateValue(record) {
  */
 const SOURCE_PERMISSIONS = ["leads.read", "customers.read", "services.read"];
 
+/*
+ * Service demand: how many leads and customers carry each service, top five.
+ *
+ * A converted lead and the customer it became are one entity (migration 017),
+ * so a converted lead is not counted: the customer's services are the current
+ * truth, and the lead's are what was asked for before conversion. Counting
+ * both showed a client's old enquiry as demand on top of what they now take.
+ */
+function serviceDemandOf(leads, customers, services) {
+  const demandMap = {};
+
+  function addServiceDemand(records) {
+    records.forEach((record) => {
+      getServiceNames(record).forEach((serviceName) => {
+        demandMap[serviceName] = (demandMap[serviceName] || 0) + 1;
+      });
+    });
+  }
+
+  addServiceDemand(leads.filter((lead) => normalizeStatus(lead.status) !== "converted"));
+  addServiceDemand(customers);
+
+  // Resolve service ids into names: { "1": 5 } becomes { "CRM Implementation": 5 }.
+  services.forEach((service) => {
+    const serviceId = String(service.id);
+
+    if (demandMap[serviceId] !== undefined) {
+      const count = demandMap[serviceId];
+
+      delete demandMap[serviceId];
+
+      demandMap[service.name] = (demandMap[service.name] || 0) + count;
+    }
+  });
+
+  return Object.entries(demandMap)
+    .map(([name, count]) => ({
+      name,
+      count,
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+}
+
 function readScope(permissions) {
   const held = new Set(Array.isArray(permissions) ? permissions : []);
 
@@ -347,52 +391,7 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
    * =======================================================
    */
 
-  const demandMap = {};
-
-  function addServiceDemand(records) {
-    records.forEach((record) => {
-      const recordServices = getServiceNames(record);
-
-      recordServices.forEach((serviceName) => {
-        demandMap[serviceName] = (demandMap[serviceName] || 0) + 1;
-      });
-    });
-  }
-
-  addServiceDemand(leads);
-  addServiceDemand(customers);
-
-  /*
-   * Resolve service IDs into service names.
-   *
-   * Example:
-   *
-   * "1": 5
-   *
-   * becomes:
-   *
-   * "CRM Implementation": 5
-   */
-
-  services.forEach((service) => {
-    const serviceId = String(service.id);
-
-    if (demandMap[serviceId] !== undefined) {
-      const count = demandMap[serviceId];
-
-      delete demandMap[serviceId];
-
-      demandMap[service.name] = (demandMap[service.name] || 0) + count;
-    }
-  });
-
-  const serviceDemand = Object.entries(demandMap)
-    .map(([name, count]) => ({
-      name,
-      count,
-    }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 5);
+  const serviceDemand = serviceDemandOf(leads, customers, services);
 
   /*
    * =======================================================
@@ -569,4 +568,5 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
 module.exports = {
   getDashboardData,
   readScope,
+  serviceDemandOf,
 };
