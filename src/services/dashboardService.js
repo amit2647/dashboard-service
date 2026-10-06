@@ -2,7 +2,9 @@ const {
   leadServiceUrl,
   customerServiceUrl,
   serviceServiceUrl,
+  obligationServiceUrl,
 } = require("../config/services");
+const { installedBundle } = require("./bundleContext");
 
 const { redisClient } = require("../config/redis");
 
@@ -137,7 +139,61 @@ function getDateValue(record) {
  * someone granted only the Dashboard would be served figures (and recent lead
  * names) computed for an admin who loaded it moments earlier.
  */
-const SOURCE_PERMISSIONS = ["leads.read", "customers.read", "services.read"];
+// What the figures are built from; the cache is shared only between callers
+// who can read the same of these. obligations.read feeds the bundle cards.
+const SOURCE_PERMISSIONS = ["leads.read", "customers.read", "services.read", "obligations.read"];
+
+/*
+ * A profession bundle's cards (DASH-01): each names a query and its
+ * parameters; this is where the queries live. A card the caller has no
+ * permission for is left out. Pure apart from the deadline counts, which are
+ * fetched once and passed in.
+ *
+ *   clients_total        — every client, hint: regular / one-time
+ *   clients_with_service — clients taking any of params.services (keys)
+ *   obligations_by_state — this year's deadlines in params.state
+ */
+function bundleCardsOf(cards, { customers, leads = [], permissions, deadlineCounts }) {
+  const held = new Set(Array.isArray(permissions) ? permissions : []);
+  const serviceKeysOf = (customer) => new Set((customer.services || []).map((service) => service.key).filter(Boolean));
+
+  return (cards || [])
+    .filter((card) => !card.permission || held.has(card.permission))
+    .map((card) => {
+      const params = card.query?.params || {};
+      let value = null;
+      let hint = null;
+
+      switch (card.query?.name) {
+        case "clients_total": {
+          const oneTime = customers.filter((customer) => customer.attributes?.client_type === "one_time").length;
+          value = customers.length;
+          hint = `${customers.length - oneTime} regular · ${oneTime} one-time`;
+          break;
+        }
+        case "clients_with_service": {
+          const wanted = Array.isArray(params.services) ? params.services : [];
+          value = customers.filter((customer) => wanted.some((key) => serviceKeysOf(customer).has(key))).length;
+          break;
+        }
+        case "prospects_open": {
+          // Prospects still being worked: not yet a client, not lost.
+          const open = leads.filter((lead) => !["converted", "lost"].includes(normalizeStatus(lead.status)));
+          const quoted = open.filter((lead) => lead.quoted_fee !== null && lead.quoted_fee !== undefined && lead.quoted_fee !== "").length;
+          value = open.length;
+          hint = `${quoted} with a quote`;
+          break;
+        }
+        case "obligations_by_state":
+          value = deadlineCounts ? deadlineCounts[params.state] ?? 0 : null;
+          break;
+        default:
+          value = null;
+      }
+
+      return { key: card.key, label: card.label, query: card.query?.name || null, params, value, hint };
+    });
+}
 
 /*
  * Service demand: how many leads and customers carry each service, top five.
@@ -395,6 +451,30 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
 
   /*
    * =======================================================
+   * PROFESSION BUNDLE CARDS
+   * =======================================================
+   *
+   * Only for an organization with a bundle that ships cards; nothing is
+   * added otherwise, so its dashboard is exactly as before.
+   */
+
+  let bundleCards = null;
+  // authorizationToken is the whole header; bundleContext (a shared copy) adds "Bearer ".
+  const bundleToken = String(authorizationToken || "").replace(/^Bearer\s+/i, "");
+  const bundle = await installedBundle(organizationId, bundleToken).catch((error) => {
+    console.error(`[Dashboard] bundle lookup failed: ${error.message}`);
+    return null;
+  });
+
+  if (bundle && Array.isArray(bundle.dashboard) && bundle.dashboard.length > 0) {
+    const wantsDeadlines = bundle.dashboard.some((card) => card.query?.name === "obligations_by_state") && (permissions || []).includes("obligations.read");
+    const deadlines = wantsDeadlines ? await getJsonOrEmpty(`${obligationServiceUrl}/obligations`, authorizationToken).catch(() => null) : null;
+
+    bundleCards = bundleCardsOf(bundle.dashboard, { customers, leads, permissions, deadlineCounts: deadlines?.counts || null });
+  }
+
+  /*
+   * =======================================================
    * RECENT LEADS
    * =======================================================
    */
@@ -538,6 +618,8 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
 
     managedRecords: leads.length + customers.length,
 
+    bundleCards,
+
     generatedAt: new Date().toISOString(),
   };
 
@@ -569,4 +651,5 @@ module.exports = {
   getDashboardData,
   readScope,
   serviceDemandOf,
+  bundleCardsOf,
 };
