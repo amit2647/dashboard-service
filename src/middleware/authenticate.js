@@ -1,6 +1,5 @@
-const jwt = require("jsonwebtoken");
-
 const { mergeAccessGrants } = require("./accessGrants");
+const verifyToken = require("./verifyToken");
 
 async function authenticate(req, res, next) {
   const authorization = req.headers.authorization;
@@ -14,9 +13,8 @@ async function authenticate(req, res, next) {
   const token = authorization.substring("Bearer ".length).trim();
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
-      issuer: process.env.JWT_ISSUER,
-    });
+    // Hydra's RS256 tokens or, during P1 only, legacy HS256 ones.
+    const decoded = await verifyToken(token);
 
     req.auth = {
       userId: Number(decoded.sub),
