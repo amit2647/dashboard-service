@@ -8,6 +8,9 @@ const { installedBundle } = require("./bundleContext");
 
 const { redisClient } = require("../config/redis");
 
+// How long the figures are cached per caller and scope (DASHBOARD_CACHE_SECONDS).
+const CACHE_SECONDS = Number(process.env.DASHBOARD_CACHE_SECONDS) || 30;
+
 /*
  * =========================================================
  * HTTP HELPERS
@@ -628,7 +631,7 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
    * REDIS CACHE WRITE
    * =======================================================
    *
-   * Cache for 30 seconds.
+   * Cache for CACHE_SECONDS (DASHBOARD_CACHE_SECONDS, default 30).
    *
    * If Redis write fails, the dashboard
    * response is still returned normally.
@@ -636,10 +639,10 @@ async function getDashboardData(authorizationToken, organizationId, permissions)
 
   try {
     await redisClient.set(cacheKey, JSON.stringify(dashboard), {
-      EX: 30,
+      EX: CACHE_SECONDS,
     });
 
-    console.log(`[Dashboard Cache] SET ${cacheKey} TTL=30s`);
+    console.log(`[Dashboard Cache] SET ${cacheKey} TTL=${CACHE_SECONDS}s`);
   } catch (error) {
     console.error("[Dashboard Cache] Write failed:", error);
   }
